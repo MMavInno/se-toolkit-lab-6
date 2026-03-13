@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""
+Agent CLI - Calls an LLM with tools to answer questions (Task 2).
+
+Usage:
+    uv run agent.py "Your question here"
+
+Output:
+    JSON to stdout: {"answer": "...", "source": "...", "tool_calls": [...]}
+    Debug output to stderr.
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import httpx
+from dotenv import load_dotenv
+
+
+PROJECT_ROOT = Path(__file__).parent.resolve()
+
+
+def load_config() -> dict:
+    """Load configuration from environment files."""
+    env_file = PROJECT_ROOT / ".env.agent.secret"
+    if not env_file.exists():
+        print(f"Error: {env_file} not found", file=sys.stderr)
+        sys.exit(1)
+    load_dotenv(env_file)
+
+    config = {
+        "api_key": os.getenv("LLM_API_KEY"),
+        "api_base": os.getenv("LLM_API_BASE"),
+        "model": os.getenv("LLM_MODEL"),
+    }
+
+    missing = [k for k, v in config.items() if not v and k in ["api_key", "api_base", "model"]]
+    if missing:
+        print(f"Error: Missing config: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+
+    return config
+
+
+def validate_path(path: str) -> tuple[bool, str]:
+    """Validate that a path is safe to access (no directory traversal)."""
+    if not path:
+        return False, "Empty path"
+    if ".." in path:
+        return False, "Directory traversal not allowed"
+    if path.startswith("/"):
+        return False, "Absolute paths not allowed"
+    try:
+        full_path = (PROJECT_ROOT / path).resolve()
+        if not str(full_path).startswith(str(PROJECT_ROOT)):
+            return False, "Path outside project root"
+    except Exception as e:
+        return False, f"Invalid path: {e}"
+    return True, ""
+
+
+def read_file_tool(path: str) -> str:
+    """Read the contents of a file from the project repository."""
+    is_valid, error = validate_path(path)
+    if not is_valid:
+        return f"Error: {error}"
+    
+    file_path = PROJECT_ROOT / path
+    if not file_path.exists():
+        return f"Error: File not found: {path}"
+    if not file_path.is_file():
+        return f"Error: Not a file: {path}"
+    
+    try:
+        content = file_path.read_text(encoding="utf-8")
+        max_chars = 10000
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n... [content truncated]"
+        return content
+    except Exception as e:
+        return f"Error reading file: {e}"
+
+
+def list_files_tool(path: str) -> str:
+    """List files and directories at a given path."""
+    is_valid, error = validate_path(path)
+    if not is_valid:
+        return f"Error: {error}"
+    
+    dir_path = PROJECT_ROOT / path
+    if not dir_path.exists():
+        return f"Error: Directory not found: {path}"
+    if not dir_path.is_dir():
+        return f"Error: Not a directory: {path}"
+    
+    try:
+        entries = []
+        for entry in sorted(dir_path.iterdir()):
+            if entry.name.startswith(".") and entry.name not in [".qwen"]:
+                continue
+            if entry.name in ["__pycache__", ".venv", ".git", "node_modules"]:
+                continue
+            suffix = "/" if entry.is_dir() else ""
+            entries.append(f"{entry.name}{suffix}")
+        return "\n".join(entries)
+    except Exception as e:
+        return f"Error listing directory: {e}"
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file from the project repository. Use this to read documentation files in wiki/ or source code files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from project root (e.g., 'wiki/git-workflow.md' or 'backend/main.py')",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "List files and directories at a given path. Use this to discover what files exist in a directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative directory path from project root (e.g., 'wiki/' or 'backend/')",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+]
+
+TOOL_FUNCTIONS = {
+    "read_file": read_file_tool,
+    "list_files": list_files_tool,
+}
+
+
+SYSTEM_PROMPT = """You are a helpful assistant that answers questions about a software project.
+
+You have access to these tools:
+1. list_files(path) - List files in a directory
+2. read_file(path) - Read contents of a file
+
+To answer questions:
+- For documentation questions: Use list_files("wiki/") to find relevant files, then read_file() to read them
+- For system questions: Use list_files() to explore directories, then read_file() to read source files
+- IMPORTANT: After using list_files() to find files, ALWAYS use read_file() to read the relevant files
+- Always include source references in your answer (e.g., wiki/git-workflow.md#section)
+- Be concise and accurate
+- Maximum 10 tool calls per question
+
+When you find the answer, provide it with the source reference.
+"""
+
+
+def call_llm(messages: list, config: dict, tools: list = None) -> dict:
+    """Call the LLM API and return the response."""
+    url = f"{config['api_base']}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config['api_key']}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": config["model"],
+        "messages": messages,
+    }
+    if tools:
+        payload["tools"] = tools
+
+    try:
+        response = httpx.post(url, headers=headers, json=payload, timeout=60.0)
+        response.raise_for_status()
+    except httpx.TimeoutException:
+        print("Error: LLM request timed out", file=sys.stderr)
+        sys.exit(1)
+    except httpx.RequestError as e:
+        print(f"Error: Failed to connect to LLM: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    return response.json()
+
+
+def execute_tool_call(tool_call: dict) -> str:
+    """Execute a single tool call and return the result."""
+    function = tool_call.get("function", {})
+    name = function.get("name")
+    args_str = function.get("arguments", "{}")
+    
+    try:
+        args = json.loads(args_str)
+    except json.JSONDecodeError:
+        return f"Error: Invalid arguments JSON: {args_str}"
+    
+    if name not in TOOL_FUNCTIONS:
+        return f"Error: Unknown tool: {name}"
+    
+    func = TOOL_FUNCTIONS[name]
+    print(f"  Calling {name}({args})...", file=sys.stderr)
+    
+    try:
+        return func(**args)
+    except Exception as e:
+        return f"Error executing {name}: {e}"
+
+
+def run_agentic_loop(question: str, config: dict) -> tuple[str, str, list]:
+    """Run the agentic loop to answer a question."""
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    
+    tool_calls_log = []
+    max_iterations = 10
+    
+    for iteration in range(max_iterations):
+        print(f"\n[Iteration {iteration + 1}/{max_iterations}]", file=sys.stderr)
+        
+        response_data = call_llm(messages, config, tools=TOOLS)
+        choice = response_data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        tool_calls = message.get("tool_calls")
+        
+        if tool_calls:
+            messages.append(message)
+            
+            for tool_call in tool_calls:
+                result = execute_tool_call(tool_call)
+                function = tool_call.get("function", {})
+                tool_calls_log.append({
+                    "tool": function.get("name"),
+                    "args": json.loads(function.get("arguments", "{}")),
+                    "result": result,
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.get("id"),
+                    "content": result,
+                })
+        else:
+            answer = message.get("content") or ""
+            source = extract_source(answer)
+            return answer, source, tool_calls_log
+    
+    print("Warning: Max iterations reached", file=sys.stderr)
+    return "I was unable to find a complete answer within the tool call limit.", "", tool_calls_log
+
+
+def extract_source(answer: str) -> str:
+    """Try to extract a source reference from the answer."""
+    import re
+    patterns = [
+        r'(wiki/[\w-]+\.md(?:#[\w-]+)?)',
+        r'(backend/[\w/]+\.py)',
+        r'(frontend/[\w/]+\.(?:ts|tsx|js|jsx))',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, answer)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def main():
+    """Main entry point."""
+    if len(sys.argv) < 2:
+        print("Usage: uv run agent.py \"<question>\"", file=sys.stderr)
+        sys.exit(1)
+
+    question = sys.argv[1]
+    config = load_config()
+    print(f"Question: {question}", file=sys.stderr)
+
+    answer, source, tool_calls = run_agentic_loop(question, config)
+
+    result = {
+        "answer": answer,
+        "source": source,
+        "tool_calls": tool_calls,
+    }
+
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()
