@@ -1,24 +1,19 @@
-# Agent Architecture (Task 2)
+# Agent Architecture (Task 2 & 3)
 
 ## Overview
 
-CLI agent that answers questions using an LLM with tools (`read_file`, `list_files`).
-
-## Architecture
-
-```
-User Question → agent.py → LLM API → tool calls → execute → final answer
-```
+CLI agent that answers questions using an LLM with tools.
 
 ## Tools
 
 ### `read_file(path)`
 Read file contents from project repository.
-- **Security:** Rejects `../` paths
 
 ### `list_files(path)`
 List files/directories at given path.
-- **Security:** Rejects `../` paths
+
+### `query_api(method, path, body)` (Task 3)
+Call backend API with LMS_API_KEY authentication.
 
 ## Agentic Loop
 
@@ -44,6 +39,11 @@ List files/directories at given path.
 LLM_API_KEY=...
 LLM_API_BASE=http://localhost:42005/v1
 LLM_MODEL=qwen3-coder-plus
+```
+
+`.env.docker.secret`:
+```
+LMS_API_KEY=...  # For query_api authentication
 ```
 
 ## How to Run

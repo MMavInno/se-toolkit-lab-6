@@ -30,6 +30,11 @@ def load_config() -> dict:
         sys.exit(1)
     load_dotenv(env_file)
 
+    # Also load LMS_API_KEY from .env.docker.secret if it exists
+    lms_env_file = PROJECT_ROOT / ".env.docker.secret"
+    if lms_env_file.exists():
+        load_dotenv(lms_env_file, override=False)
+
     config = {
         "api_key": os.getenv("LLM_API_KEY"),
         "api_base": os.getenv("LLM_API_BASE"),
@@ -109,6 +114,33 @@ def list_files_tool(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def query_api_tool(method: str, path: str, body: str = None) -> str:
+    """Call the backend API."""
+    base_url = os.getenv("AGENT_API_BASE_URL", "http://localhost:42002")
+    lms_api_key = os.getenv("LMS_API_KEY", "")
+    
+    url = f"{base_url}{path}"
+    headers = {"Content-Type": "application/json"}
+    if lms_api_key:
+        headers["Authorization"] = f"Bearer {lms_api_key}"
+    
+    try:
+        if method.upper() == "GET":
+            response = httpx.get(url, headers=headers, timeout=30.0)
+        elif method.upper() == "POST":
+            response = httpx.post(url, headers=headers, json=json.loads(body) if body else {}, timeout=30.0)
+        else:
+            return f"Error: Unsupported method: {method}"
+        
+        return json.dumps({"status_code": response.status_code, "body": response.text})
+    except httpx.TimeoutException:
+        return json.dumps({"status_code": 0, "body": "Error: Request timed out"})
+    except httpx.RequestError as e:
+        return json.dumps({"status_code": 0, "body": f"Error: {str(e)}"})
+    except json.JSONDecodeError as e:
+        return json.dumps({"status_code": 0, "body": f"Error: Invalid JSON body: {e}"})
+
+
 TOOLS = [
     {
         "type": "function",
@@ -144,11 +176,37 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_api",
+            "description": "Call the backend API to query data or check system status. Use this for questions about database content, analytics, or system state.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "method": {
+                        "type": "string",
+                        "description": "HTTP method (GET, POST, etc.)",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "API endpoint path (e.g., '/items/', '/analytics/completion-rate')",
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Optional JSON request body for POST requests",
+                    },
+                },
+                "required": ["method", "path"],
+            },
+        },
+    },
 ]
 
 TOOL_FUNCTIONS = {
     "read_file": read_file_tool,
     "list_files": list_files_tool,
+    "query_api": query_api_tool,
 }
 
 
@@ -157,12 +215,14 @@ SYSTEM_PROMPT = """You are a helpful assistant that answers questions about a so
 You have access to these tools:
 1. list_files(path) - List files in a directory
 2. read_file(path) - Read contents of a file
+3. query_api(method, path, body) - Call the backend API
 
 To answer questions:
 - For documentation questions: Use list_files("wiki/") to find relevant files, then read_file() to read them
-- For system questions: Use list_files() to explore directories, then read_file() to read source files
+- For system questions (framework, ports, etc.): Use list_files() to explore directories, then read_file() to read source files
+- For data questions (database content, analytics): Use query_api() to query the backend
 - IMPORTANT: After using list_files() to find files, ALWAYS use read_file() to read the relevant files
-- Always include source references in your answer (e.g., wiki/git-workflow.md#section)
+- Always include source references in your answer (e.g., wiki/git-workflow.md#section or backend/app/main.py)
 - Be concise and accurate
 - Maximum 10 tool calls per question
 
