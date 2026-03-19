@@ -23,4 +23,25 @@ Add more details if necessary.
 - [ ] I edited the line `- Closes #<issue-number>`.
 - [ ] I wrote clear commit messages.
 - [ ] I reviewed my own diff before requesting review.
-- [ ] I understand the changes I’m submitting.
+- [ ] I understand the changes I'm submitting.
+
+---
+
+## Task 3 Instructions
+
+**For Task 3 PR, use this template:**
+
+**Title:** `[Task] The System Agent (Task 3)`
+
+**Description:**
+
+```markdown
+Implements Task 3: The System Agent with query_api tool for backend API access.
+
+- Added query_api tool with LMS_API_KEY authentication
+- Updated AGENT.md documentation (764 words)
+- Added 2 regression tests
+- Updated plans/task-3.md
+
+Closes #<issue-number>
+```
